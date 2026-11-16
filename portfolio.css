@@ -152,3 +152,8 @@
     .cw-feature { padding: 0; }
     .cw-feature-media img { margin-top: 0; }
   }
+
+/* Added for the populated site */
+.cw-item.cw-square img { aspect-ratio: 1 / 1; }
+.cw-portrait { display: block; width: 100%; max-width: 280px; aspect-ratio: 2 / 3; object-fit: cover; border: 1px solid var(--line); background: var(--card); margin: 0 0 24px; }
+.cw-cover { display: block; width: 100%; max-width: 420px; aspect-ratio: 1 / 1; object-fit: cover; border: 1px solid var(--line); background: var(--card); margin: 0 0 24px; }
