@@ -11,42 +11,21 @@
   }
 
   // ---------- CONFIG ----------
-  var BAR_COUNT = 80;             // number of bars in each visualiser
-  var BAR_COLOR = '#ffffff';      // bar colour
-  var IDLE_LEVEL = 0.06;          // bar height when paused
+  var BAR_COUNT = 80;             // bars per waveform
+  var PLAYED = '#ffffff';         // bars already played
+  var UNPLAYED = '#5a5a5a';       // bars still to play
 
   // ---------- STATE ----------
-  var items = [];
-  var current = null;
-  var audioCtx = null;
-  var scApiPromise = null;
+  var root = null;
   var views = {};
   var links = [];
-  var root = null;
+  var items = [];                 // audio snippets
+  var carousels = [];             // photo carousels
+  var current = null;             // the snippet playing now
+  var decodeCtx = null;
 
-  function ensureAudioCtx() {
-    if (!audioCtx) {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return null;
-      audioCtx = new AC();
-    }
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    return audioCtx;
-  }
-
-  // ---------- CANVAS ----------
-  function setupCanvas(canvas) {
-    var dpr = window.devicePixelRatio || 1;
-    var w = canvas.clientWidth || 200;
-    var h = canvas.clientHeight || 56;
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-    var c = canvas.getContext('2d');
-    c.setTransform(dpr, 0, 0, dpr, 0, 0);
-    return { ctx: c, w: w, h: h };
-  }
-
-  // A fixed, uneven shape so the resting state reads as a waveform, not a row of dashes
+  // ---------- WAVEFORM ----------
+  // Fallback shape, used only if a snippet can't be decoded
   function makeShape(n, seed) {
     var out = [];
     for (var i = 0; i < n; i++) {
@@ -56,159 +35,197 @@
     return out;
   }
 
-  // ---------- AUDIO PREVIEW SETUP ----------
+  function setupCanvas(item) {
+    var dpr = window.devicePixelRatio || 1;
+    var w = item.canvas.clientWidth || 300;
+    var h = item.canvas.clientHeight || 56;
+    item.canvas.width = Math.round(w * dpr);
+    item.canvas.height = Math.round(h * dpr);
+    var c = item.canvas.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    item.ctx = c;
+    item.w = w;
+    item.h = h;
+  }
+
+  // Reads the real sound of the snippet and turns it into bar heights
+  function loadPeaks(item) {
+    if (item.requested) return;
+    item.requested = true;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !window.fetch) { item.peaks = item.shape; return; }
+    decodeCtx = decodeCtx || new AC();
+    fetch(item.src)
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+      .then(function (buf) { return decodeCtx.decodeAudioData(buf); })
+      .then(function (audioBuf) {
+        var data = audioBuf.getChannelData(0);
+        var step = Math.max(1, Math.floor(data.length / BAR_COUNT));
+        var peaks = [], top = 0;
+        for (var i = 0; i < BAR_COUNT; i++) {
+          var max = 0, start = i * step, end = Math.min(data.length, start + step);
+          for (var k = start; k < end; k++) {
+            var a = Math.abs(data[k]);
+            if (a > max) max = a;
+          }
+          peaks.push(max);
+          if (max > top) top = max;
+        }
+        // normalise, and lift quiet passages so the shape stays readable
+        for (var m = 0; m < peaks.length; m++) {
+          peaks[m] = top ? Math.max(0.08, Math.pow(peaks[m] / top, 0.7)) : 0.08;
+        }
+        item.peaks = peaks;
+        item.canvas.setAttribute('data-wave', 'decoded');
+      })
+      .catch(function () {
+        item.peaks = item.shape;
+        item.canvas.setAttribute('data-wave', 'fallback');
+      });
+  }
+
   function initAudio(box) {
-    var type = box.getAttribute('data-type');
     var src = box.getAttribute('data-src');
     var button = box.querySelector('button');
     var canvas = box.querySelector('canvas');
-    if (!button || !canvas) return;
+    if (!src || !button || !canvas) return;
 
-    var sh = makeShape(BAR_COUNT, items.length);
+    var audio = new Audio();
+    audio.preload = 'none';
+    audio.src = src;
+
     var item = {
-      box: box, button: button, canvas: canvas,
-      type: type, src: src,
-      playing: false, shape: sh, levels: sh.slice(),
-      audio: null, analyser: null, widget: null, iframe: null,
-      play: null, pause: null, size: null
+      box: box, button: button, canvas: canvas, src: src, audio: audio,
+      shape: makeShape(BAR_COUNT, items.length + 1), peaks: null,
+      requested: false, playing: false, ratio: 0, pendingSeek: null
     };
     items.push(item);
-    item.size = setupCanvas(canvas);
-
-    if (!src || !type) { button.disabled = true; return; }
+    setupCanvas(item);
     button.disabled = false;
-
-    if (type === 'file') setupFile(item);
-    else if (type === 'soundcloud') setupSoundCloud(item);
-    else { button.disabled = true; return; }
 
     button.addEventListener('click', function (e) {
       e.stopPropagation();
-      if (item.playing) item.pause(); else item.play();
+      if (item.playing) pause(item); else play(item);
     });
-    canvas.addEventListener('click', function () {
-      if (item.playing) item.pause(); else item.play();
+    canvas.addEventListener('click', function (e) { seek(item, e); });
+
+    audio.addEventListener('timeupdate', function () {
+      if (audio.duration) item.ratio = audio.currentTime / audio.duration;
     });
-  }
-
-  // ---------- FILE MODE (real audio reaction) ----------
-  function setupFile(item) {
-    var audio = new Audio();
-    audio.crossOrigin = 'anonymous';
-    audio.preload = 'auto';
-    audio.src = item.src;
-    item.audio = audio;
-
-    audio.addEventListener('ended', function () { stopItem(item); });
-
-    item.play = function () {
-      if (current && current !== item) current.pause();
-      var ctx = ensureAudioCtx();
-      if (ctx && !item.analyser) {
-        try {
-          var source = ctx.createMediaElementSource(audio);
-          item.analyser = ctx.createAnalyser();
-          item.analyser.fftSize = 128;
-          source.connect(item.analyser);
-          item.analyser.connect(ctx.destination);
-        } catch (err) { item.analyser = null; }
+    audio.addEventListener('loadedmetadata', function () {
+      if (item.pendingSeek !== null && audio.duration) {
+        audio.currentTime = item.pendingSeek * audio.duration;
+        item.pendingSeek = null;
       }
-      audio.play();
-      item.playing = true;
-      item.button.textContent = '❚❚';
-      current = item;
-    };
-    item.pause = function () { audio.pause(); stopItem(item); };
-  }
-
-  // ---------- SOUNDCLOUD MODE (animation follows play state, not the sound) ----------
-  function loadScApi() {
-    if (scApiPromise) return scApiPromise;
-    scApiPromise = new Promise(function (resolve, reject) {
-      if (window.SC && window.SC.Widget) return resolve();
-      var s = document.createElement('script');
-      s.src = 'https://w.soundcloud.com/player/api.js';
-      s.onload = function () { resolve(); };
-      s.onerror = reject;
-      document.head.appendChild(s);
     });
-    return scApiPromise;
+    audio.addEventListener('ended', function () {
+      audio.currentTime = 0;
+      item.ratio = 0;
+      stop(item);
+    });
   }
 
-  function setupSoundCloud(item) {
-    var iframe = document.createElement('iframe');
-    iframe.className = 'cw-sc';
-    iframe.setAttribute('allow', 'autoplay');
-    iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(item.src) +
-      '&auto_play=false&visual=false&show_artwork=false&show_user=false&show_comments=false&show_reposts=false&show_teaser=false&hide_related=true';
-    item.box.appendChild(iframe);
-    item.iframe = iframe;
-
-    loadScApi().then(function () {
-      item.widget = window.SC.Widget(iframe);
-      item.widget.bind(window.SC.Widget.Events.PLAY, function () {
-        if (current && current !== item) current.pause();
-        item.playing = true;
-        item.button.textContent = '❚❚';
-        current = item;
-      });
-      item.widget.bind(window.SC.Widget.Events.PAUSE, function () { stopItem(item); });
-      item.widget.bind(window.SC.Widget.Events.FINISH, function () { stopItem(item); });
-    }).catch(function () { /* SoundCloud API blocked; the player button stays disabled */ });
-
-    item.play = function () { if (item.widget) item.widget.play(); };
-    item.pause = function () { if (item.widget) { item.widget.pause(); } stopItem(item); };
+  function play(item) {
+    if (current && current !== item) pause(current);
+    var p = item.audio.play();
+    if (p && p.catch) p.catch(function () { stop(item); });
+    item.playing = true;
+    item.button.textContent = '❚❚';
+    current = item;
   }
 
-  function stopItem(item) {
+  function pause(item) {
+    item.audio.pause();
+    stop(item);
+  }
+
+  function stop(item) {
     item.playing = false;
     item.button.textContent = '▶';
     if (current === item) current = null;
   }
 
+  function seek(item, e) {
+    var rect = item.canvas.getBoundingClientRect();
+    var r = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    item.ratio = r;
+    if (item.audio.duration) {
+      item.audio.currentTime = r * item.audio.duration;
+    } else {
+      item.pendingSeek = r;
+    }
+    if (!item.playing) play(item);
+  }
+
   // ---------- DRAW LOOP ----------
-  var t = 0;
+  function drawItem(item) {
+    if (!item.canvas.offsetParent) return;           // hidden view: nothing to draw
+    if (item.canvas.clientWidth !== item.w || item.canvas.clientHeight !== item.h) setupCanvas(item);
+    var c = item.ctx, w = item.w, h = item.h;
+    var bars = item.peaks || item.shape;
+    c.clearRect(0, 0, w, h);
+    var slot = w / BAR_COUNT, bw = Math.max(2, Math.floor(slot * 0.6));
+    for (var i = 0; i < BAR_COUNT; i++) {
+      var bh = Math.max(2, bars[i] * h);
+      var played = (i + 0.5) / BAR_COUNT <= item.ratio;
+      c.fillStyle = played ? PLAYED : UNPLAYED;
+      c.fillRect(i * slot + (slot - bw) / 2, (h - bh) / 2, bw, bh);
+    }
+  }
+
   function frame() {
     requestAnimationFrame(frame);
-    t += 0.05;
     items.forEach(function (item) {
-      try { drawItem(item); } catch (err) { /* keep the other waveforms running */ }
+      try { drawItem(item); } catch (err) { /* keep the others drawing */ }
     });
   }
 
-  function drawItem(item) {
-    {
-      if (!item.size) return;
-      var c = item.size.ctx, w = item.size.w, h = item.size.h;
-      c.clearRect(0, 0, w, h);
+  // ---------- CAROUSELS ----------
+  function setupCarousel(c) {
+    var track = c.querySelector('.cw-track');
+    var prev = c.querySelector('.cw-prev');
+    var next = c.querySelector('.cw-next');
+    var count = c.querySelector('.cw-count');
+    if (!track || !prev || !next) return;
 
-      var target = new Array(BAR_COUNT);
-      if (item.playing && item.analyser) {
-        var data = new Uint8Array(item.analyser.frequencyBinCount);
-        item.analyser.getByteFrequencyData(data);
-        for (var i = 0; i < BAR_COUNT; i++) {
-          var idx = Math.floor((i / BAR_COUNT) * data.length);
-          target[i] = Math.max(0.1, data[idx] / 255);
-        }
-      } else if (item.playing) {
-        for (var j = 0; j < BAR_COUNT; j++) {
-          target[j] = item.shape[j] * (0.55 + 0.45 * Math.abs(Math.sin(t * 2 + j * 0.5)));
-        }
-      } else {
-        for (var k = 0; k < BAR_COUNT; k++) target[k] = item.shape[k];
-      }
-
-      for (var m = 0; m < BAR_COUNT; m++) {
-        item.levels[m] += (target[m] - item.levels[m]) * 0.25;
-      }
-
-      var slot = w / BAR_COUNT, bw = 2;
-      c.fillStyle = item.playing ? '#ffffff' : '#5a5a5a';
-      for (var n = 0; n < BAR_COUNT; n++) {
-        var bh = Math.max(2, item.levels[n] * h);
-        c.fillRect(n * slot + (slot - bw) / 2, (h - bh) / 2, bw, bh);
-      }
+    function step() {
+      var first = track.firstElementChild;
+      return first ? first.offsetWidth + 12 : 0;
     }
+    function update() {
+      var n = track.children.length;
+      var idx = step() ? Math.round(track.scrollLeft / step()) : 0;
+      if (count) count.textContent = n ? (Math.min(idx, n - 1) + 1) + ' / ' + n : '';
+      prev.disabled = n <= 1 || track.scrollLeft <= 4;
+      next.disabled = n <= 1 || track.scrollLeft + track.clientWidth >= track.scrollWidth - 4;
+    }
+    prev.addEventListener('click', function () { track.scrollBy({ left: -step(), behavior: 'smooth' }); });
+    next.addEventListener('click', function () { track.scrollBy({ left: step(), behavior: 'smooth' }); });
+    track.addEventListener('scroll', update, { passive: true });
+    carousels.push({ el: c, update: update });
+    update();
+  }
+
+  // ---------- FILTER: films by role ----------
+  function setupFilters() {
+    root.querySelectorAll('.cw-filters').forEach(function (bar) {
+      var section = bar.closest('.cw-view');
+      var buttons = bar.querySelectorAll('.cw-filter');
+      buttons.forEach(function (b) {
+        b.addEventListener('click', function () {
+          var role = b.getAttribute('data-role');
+          buttons.forEach(function (x) {
+            var on = x === b;
+            x.classList.toggle('is-active', on);
+            x.setAttribute('aria-pressed', on ? 'true' : 'false');
+          });
+          section.querySelectorAll('.cw-item[data-roles]').forEach(function (card) {
+            var roles = card.getAttribute('data-roles').split('|');
+            card.hidden = !(role === 'all' || roles.indexOf(role) > -1);
+          });
+        });
+      });
+    });
   }
 
   // ---------- ROUTING: one view at a time, driven by the URL hash ----------
@@ -222,9 +239,14 @@
     Object.keys(views).forEach(function (k) {
       views[k].classList.toggle('is-active', views[k] === target);
     });
-    // Canvases in a hidden view measure as zero, so re-measure once shown.
     items.forEach(function (item) {
-      if (target.contains(item.box)) item.size = setupCanvas(item.canvas);
+      if (target.contains(item.box)) {
+        setupCanvas(item);
+        loadPeaks(item);
+      }
+    });
+    carousels.forEach(function (c) {
+      if (target.contains(c.el)) c.update();
     });
     return target;
   }
@@ -246,7 +268,6 @@
     var viewId = 'home';
 
     if (hash === 'showreel' || hash === 'selected') {
-      viewId = 'home';
       scrollTo = document.getElementById(hash);
     } else if (views[hash]) {
       viewId = hash;
@@ -254,8 +275,6 @@
 
     var target = showView(viewId);
     root.classList.toggle('is-home', viewId === 'home');
-    var big = root.querySelector('.cw-big-name');
-    if (big) big.style.setProperty('display', viewId === 'home' ? 'block' : 'none', 'important');
     fitSub();
     var cat = scrollTo ? 'showreel' : (target.getAttribute('data-cat') || 'showreel');
     links.forEach(function (a) { a.classList.toggle('is-active', a.getAttribute('data-cat') === cat); });
@@ -275,21 +294,21 @@
     root.querySelectorAll('.cw-view').forEach(function (v) { views[v.id] = v; });
     links = Array.prototype.slice.call(root.querySelectorAll('.cw-nav a'));
 
-    route();
-
-    // Each waveform is set up on its own, so one failure can't stop the others.
+    // Each piece is set up on its own, so one failure can't stop the others.
     root.querySelectorAll('.cw-audio').forEach(function (box) {
       try { initAudio(box); } catch (err) { if (window.console) console.error('Audio setup failed:', err); }
     });
+    root.querySelectorAll('.cw-carousel').forEach(function (c) {
+      try { setupCarousel(c); } catch (err) { if (window.console) console.error('Carousel setup failed:', err); }
+    });
+    try { setupFilters(); } catch (err) { if (window.console) console.error('Filter setup failed:', err); }
+
+    route();
 
     window.addEventListener('hashchange', route);
     window.addEventListener('resize', fitSub);
+    window.addEventListener('resize', function () { carousels.forEach(function (c) { c.update(); }); });
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitSub);
-    window.addEventListener('resize', function () {
-      items.forEach(function (item) {
-        if (item.box.closest('.cw-view.is-active')) item.size = setupCanvas(item.canvas);
-      });
-    });
 
     requestAnimationFrame(frame);
   }
