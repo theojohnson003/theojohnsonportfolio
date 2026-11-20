@@ -11,20 +11,38 @@
   }
 
   // ---------- CONFIG ----------
-  var BAR_COUNT = 80;             // bars per waveform
-  var PLAYED = '#ffffff';         // bars already played
-  var UNPLAYED = '#5a5a5a';       // bars still to play
+  var BAR_COUNT = 80;             // bars per snippet waveform
+  var PLAYED = '#ffffff';         // waveform bars already played
+  var UNPLAYED = '#5a5a5a';       // waveform bars still to play
+  var EQ_STEP = 5;                // header equaliser: distance between bars in px
+  var EQ_BAR = 2;                 // header equaliser: bar width in px
+  var EQ_HEIGHT = 14;             // header equaliser: how far bars hang below the header line
 
   // ---------- STATE ----------
   var root = null;
   var views = {};
   var links = [];
   var items = [];                 // audio snippets
-  var carousels = [];             // photo carousels
+  var loops = [];                 // infinite photo galleries
   var current = null;             // the snippet playing now
   var decodeCtx = null;
+  var playCtx = null;
+  var eq = null;                  // header equaliser
+  var clock = 0;
 
-  // ---------- WAVEFORM ----------
+  // ---------- AUDIO CONTEXT ----------
+  function getAudioClass() {
+    return window.AudioContext || window.webkitAudioContext || null;
+  }
+
+  function ensurePlayCtx() {
+    var AC = getAudioClass();
+    if (!AC) return null;
+    if (!playCtx) playCtx = new AC();
+    if (playCtx.state === 'suspended') playCtx.resume();
+    return playCtx;
+  }
+
   // Fallback shape, used only if a snippet can't be decoded
   function makeShape(n, seed) {
     var out = [];
@@ -52,7 +70,7 @@
   function loadPeaks(item) {
     if (item.requested) return;
     item.requested = true;
-    var AC = window.AudioContext || window.webkitAudioContext;
+    var AC = getAudioClass();
     if (!AC || !window.fetch) { item.peaks = item.shape; return; }
     decodeCtx = decodeCtx || new AC();
     fetch(item.src)
@@ -71,7 +89,6 @@
           peaks.push(max);
           if (max > top) top = max;
         }
-        // normalise, and lift quiet passages so the shape stays readable
         for (var m = 0; m < peaks.length; m++) {
           peaks[m] = top ? Math.max(0.08, Math.pow(peaks[m] / top, 0.7)) : 0.08;
         }
@@ -84,6 +101,7 @@
       });
   }
 
+  // ---------- SNIPPET PLAYERS ----------
   function initAudio(box) {
     var src = box.getAttribute('data-src');
     var button = box.querySelector('button');
@@ -91,13 +109,15 @@
     if (!src || !button || !canvas) return;
 
     var audio = new Audio();
+    audio.crossOrigin = 'anonymous';   // lets the header equaliser read the sound
     audio.preload = 'none';
     audio.src = src;
 
     var item = {
       box: box, button: button, canvas: canvas, src: src, audio: audio,
       shape: makeShape(BAR_COUNT, items.length + 1), peaks: null,
-      requested: false, playing: false, ratio: 0, pendingSeek: null
+      requested: false, playing: false, ratio: 0, pendingSeek: null,
+      analyser: null, data: null
     };
     items.push(item);
     setupCanvas(item);
@@ -125,8 +145,27 @@
     });
   }
 
+  // Connects the snippet to an analyser, once, so the header can read its sound
+  function connectAnalyser(item) {
+    if (item.analyser || item.analyserFailed) return;
+    try {
+      var ctx = ensurePlayCtx();
+      if (!ctx) { item.analyserFailed = true; return; }
+      var source = ctx.createMediaElementSource(item.audio);
+      var analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      analyser.connect(ctx.destination);
+      item.analyser = analyser;
+      item.data = new Uint8Array(analyser.frequencyBinCount);
+    } catch (err) {
+      item.analyserFailed = true;
+    }
+  }
+
   function play(item) {
     if (current && current !== item) pause(current);
+    connectAnalyser(item);
     var p = item.audio.play();
     if (p && p.catch) p.catch(function () { stop(item); });
     item.playing = true;
@@ -157,7 +196,6 @@
     if (!item.playing) play(item);
   }
 
-  // ---------- DRAW LOOP ----------
   function drawItem(item) {
     if (!item.canvas.offsetParent) return;           // hidden view: nothing to draw
     if (item.canvas.clientWidth !== item.w || item.canvas.clientHeight !== item.h) setupCanvas(item);
@@ -173,37 +211,137 @@
     }
   }
 
+  // ---------- HEADER EQUALISER ----------
+  // Bars hang down from the header line. They only move while a snippet is playing.
+  function setupEq() {
+    var canvas = root.querySelector('.cw-eq canvas');
+    if (!canvas) return;
+    eq = { canvas: canvas, ctx: canvas.getContext('2d'), levels: [], cleared: false };
+    sizeEq();
+  }
+
+  function sizeEq() {
+    if (!eq) return;
+    var dpr = window.devicePixelRatio || 1;
+    var w = eq.canvas.clientWidth || window.innerWidth;
+    var h = eq.canvas.clientHeight || EQ_HEIGHT;
+    eq.canvas.width = Math.round(w * dpr);
+    eq.canvas.height = Math.round(h * dpr);
+    eq.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    eq.w = w;
+    eq.h = h;
+    eq.count = Math.max(1, Math.floor(w / EQ_STEP));
+    eq.levels = new Array(eq.count).fill(0);
+  }
+
+  // The level for one bar, taken from the live sound if we have it, otherwise from the decoded peaks
+  function eqLevel(item, i) {
+    var live = 0;
+    if (item.analyser && item.data) {
+      var bins = item.data.length;
+      var bin = Math.min(bins - 1, Math.floor(Math.pow(bins * 0.5, i / eq.count)));
+      live = item.data[bin] / 255;
+    }
+    var shape = 0;
+    if (item.peaks) {
+      var idx = Math.floor(item.ratio * BAR_COUNT);
+      var wobble = 0.55 + 0.45 * Math.abs(Math.sin(clock * 3 + i * 0.7));
+      shape = item.peaks[(idx + i * 3) % BAR_COUNT] * wobble;
+    }
+    return Math.max(live, shape);
+  }
+
+  function drawEq() {
+    if (!eq) return;
+    if (current && current.analyser && current.data) {
+      current.analyser.getByteFrequencyData(current.data);
+    }
+    var any = false;
+    for (var i = 0; i < eq.count; i++) {
+      var target = current ? eqLevel(current, i) : 0;
+      var rate = target > eq.levels[i] ? 0.5 : 0.12;   // quick rise, slow fall
+      eq.levels[i] += (target - eq.levels[i]) * rate;
+      if (eq.levels[i] > 0.01) any = true;
+    }
+    if (!current && !any) {
+      if (!eq.cleared) { eq.ctx.clearRect(0, 0, eq.w, eq.h); eq.cleared = true; }
+      return;
+    }
+    eq.cleared = false;
+    var c = eq.ctx;
+    c.clearRect(0, 0, eq.w, eq.h);
+    c.fillStyle = 'rgba(255,255,255,0.75)';
+    for (var k = 0; k < eq.count; k++) {
+      var bh = eq.levels[k] * eq.h;
+      if (bh < 1) continue;
+      c.fillRect(k * EQ_STEP, 0, EQ_BAR, bh);
+    }
+  }
+
   function frame() {
     requestAnimationFrame(frame);
+    clock += 0.016;
     items.forEach(function (item) {
       try { drawItem(item); } catch (err) { /* keep the others drawing */ }
     });
+    try { drawEq(); } catch (err) { /* the header equaliser is decoration only */ }
   }
 
-  // ---------- CAROUSELS ----------
-  function setupCarousel(c) {
-    var track = c.querySelector('.cw-track');
-    var prev = c.querySelector('.cw-prev');
-    var next = c.querySelector('.cw-next');
-    var count = c.querySelector('.cw-count');
-    if (!track || !prev || !next) return;
+  // ---------- INFINITE GALLERY ----------
+  // The photos are laid out three times over: copies, the originals, copies. When the reader
+  // scrolls into a copy, the view jumps by one full set, so it never runs out in either direction.
+  function setupLoop(el) {
+    var track = el.querySelector('.cw-loop-track');
+    if (!track) return null;
+    var originals = Array.prototype.slice.call(track.children);
+    var n = originals.length;
+    var loop = { el: el, track: track, n: n, setW: 0, step: 0, inited: false };
+    if (n < 2) {
+      var ctrls = el.querySelector('.cw-ctrls');
+      if (ctrls) ctrls.style.display = 'none';
+      return loop;
+    }
+    var before = originals.map(function (x) { return x.cloneNode(true); });
+    for (var j = before.length - 1; j >= 0; j--) track.insertBefore(before[j], track.firstChild);
+    originals.forEach(function (x) { track.appendChild(x.cloneNode(true)); });
 
-    function step() {
-      var first = track.firstElementChild;
-      return first ? first.offsetWidth + 12 : 0;
-    }
-    function update() {
-      var n = track.children.length;
-      var idx = step() ? Math.round(track.scrollLeft / step()) : 0;
-      if (count) count.textContent = n ? (Math.min(idx, n - 1) + 1) + ' / ' + n : '';
-      prev.disabled = n <= 1 || track.scrollLeft <= 4;
-      next.disabled = n <= 1 || track.scrollLeft + track.clientWidth >= track.scrollWidth - 4;
-    }
-    prev.addEventListener('click', function () { track.scrollBy({ left: -step(), behavior: 'smooth' }); });
-    next.addEventListener('click', function () { track.scrollBy({ left: step(), behavior: 'smooth' }); });
-    track.addEventListener('scroll', update, { passive: true });
-    carousels.push({ el: c, update: update });
-    update();
+    loop.prev = el.querySelector('.cw-prev');
+    loop.next = el.querySelector('.cw-next');
+    loop.count = el.querySelector('.cw-count');
+
+    loop.measure = function () {
+      var kids = track.children;
+      if (kids.length < 2 * n + 1) return;
+      loop.setW = kids[2 * n].offsetLeft - kids[n].offsetLeft;
+      var gap = parseFloat(getComputedStyle(track).columnGap) || 12;
+      loop.step = kids[n].offsetWidth + gap;
+    };
+    loop.reset = function () {
+      loop.measure();
+      if (loop.setW) {
+        track.scrollLeft = loop.setW;   // start on the originals
+        loop.inited = true;
+      }
+      loop.update();
+    };
+    loop.update = function () {
+      if (!loop.setW || !loop.count) return;
+      var x = track.scrollLeft;
+      if (x < loop.setW * 0.5) { track.scrollLeft = x + loop.setW; x += loop.setW; }
+      else if (x > loop.setW * 1.5) { track.scrollLeft = x - loop.setW; x -= loop.setW; }
+      var offset = ((x - loop.setW) % loop.setW + loop.setW) % loop.setW;
+      var idx = loop.step ? Math.round(offset / loop.step) % n : 0;
+      loop.count.textContent = (idx + 1) + ' / ' + n;
+    };
+
+    if (loop.prev) loop.prev.addEventListener('click', function () {
+      track.scrollBy({ left: -loop.step, behavior: 'smooth' });
+    });
+    if (loop.next) loop.next.addEventListener('click', function () {
+      track.scrollBy({ left: loop.step, behavior: 'smooth' });
+    });
+    track.addEventListener('scroll', loop.update, { passive: true });
+    return loop;
   }
 
   // ---------- FILTER: films by role ----------
@@ -245,8 +383,8 @@
         loadPeaks(item);
       }
     });
-    carousels.forEach(function (c) {
-      if (target.contains(c.el)) c.update();
+    loops.forEach(function (loop) {
+      if (loop && target.contains(loop.el)) loop.reset();
     });
     return target;
   }
@@ -298,16 +436,20 @@
     root.querySelectorAll('.cw-audio').forEach(function (box) {
       try { initAudio(box); } catch (err) { if (window.console) console.error('Audio setup failed:', err); }
     });
-    root.querySelectorAll('.cw-carousel').forEach(function (c) {
-      try { setupCarousel(c); } catch (err) { if (window.console) console.error('Carousel setup failed:', err); }
+    root.querySelectorAll('.cw-loop').forEach(function (el) {
+      try { loops.push(setupLoop(el)); } catch (err) { if (window.console) console.error('Gallery setup failed:', err); }
     });
     try { setupFilters(); } catch (err) { if (window.console) console.error('Filter setup failed:', err); }
+    try { setupEq(); } catch (err) { if (window.console) console.error('Equaliser setup failed:', err); }
 
     route();
 
     window.addEventListener('hashchange', route);
     window.addEventListener('resize', fitSub);
-    window.addEventListener('resize', function () { carousels.forEach(function (c) { c.update(); }); });
+    window.addEventListener('resize', function () {
+      sizeEq();
+      loops.forEach(function (loop) { if (loop) loop.reset(); });
+    });
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitSub);
 
     requestAnimationFrame(frame);

@@ -179,3 +179,33 @@
   .cw-mosaic .g1 { grid-column: 1 / -1 !important; aspect-ratio: 4 / 3; }
   .cw-feature-media img { margin-top: 0; }
 }
+
+/* ---------- v4 ---------- */
+
+/* Header equaliser: a thin strip that hangs from the header line across the full width */
+.cw-eq { position: absolute; left: 0; right: 0; top: 100%; height: 14px; pointer-events: none; overflow: hidden; }
+.cw-eq canvas { width: 100%; height: 100%; display: block; }
+@media (max-width: 900px) { .cw-eq { display: none; } }
+
+/* Infinite horizontal gallery: three tiles visible on desktop, one and a quarter on mobile */
+.cw-loop { margin-top: 8px; }
+.cw-loop-track { position: relative; display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: none; scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-x: contain; }
+.cw-loop-track::-webkit-scrollbar { display: none; }
+.cw-loop-item { flex: 0 0 calc((100% - 24px) / 3); margin: 0; }
+.cw-loop-item img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; background: var(--card); border: 1px solid var(--line); }
+@media (max-width: 720px) { .cw-loop-item { flex-basis: calc((100% - 12px) / 1.25); } }
+.cw-loop + .cw-ctrls, .cw-loop .cw-ctrls { margin-bottom: 0; }
+
+/* Album art and credits on music pages */
+.cw-cover-art img { width: 100%; max-width: 420px; aspect-ratio: 1 / 1; object-fit: cover; border: 1px solid var(--line); background: var(--card); display: block; }
+.cw-cover-col .cw-detail h4 { margin-top: 24px; }
+.cw-spotify { margin-top: 32px; max-width: 640px; }
+.cw-spotify iframe { height: 352px; }
+
+/* Portrait poster under the audio snippet */
+.cw-poster .cw-portrait-poster { aspect-ratio: auto; height: auto; object-fit: contain; max-width: 280px; margin-top: 28px; }
+
+/* About: bio on the left, profile picture on the right, BTS gallery below */
+.cw-bio p { margin: 0 0 16px; max-width: 640px; }
+.cw-profile img { max-width: 420px; aspect-ratio: 4 / 5; }
+.cw-about { padding-bottom: 8px; }
